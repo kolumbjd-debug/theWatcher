@@ -12,4 +12,5 @@ export const config = {
   heliusApiKey: requireEnv("HELIUS_API_KEY"),
   supabaseUrl: requireEnv("SUPABASE_URL"),
   supabaseKey: requireEnv("SUPABASE_KEY"),
+  archiveDir: requireEnv("ARCHIVE_DIR"),
 };

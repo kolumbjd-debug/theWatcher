@@ -1,9 +1,9 @@
 import * as fs from "fs";
 import * as path from "path";
 import { supabase } from "./supabaseClient";
+import { config } from "./config";
 
 const BATCH_SIZE = 1000;
-const ARCHIVE_DIR = path.join(__dirname, "..", "archive");
 const MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 const COLUMNS = [
@@ -40,9 +40,17 @@ export interface ArchiveResult {
 }
 
 /**
- * Archives price_gaps rows older than 24h to a local CSV, deleting each
- * batch from Supabase only after it's been written to disk. Shared by the
- * manual `npm run archive` script and the watcher's in-process scheduler.
+ * Archives price_gaps rows older than 24h to a CSV under config.archiveDir,
+ * deleting each batch from Supabase only after it's been written to disk.
+ * Shared by the manual `npm run archive` script and the watcher's
+ * in-process scheduler.
+ *
+ * config.archiveDir is expected to point at a persistent volume mount
+ * (e.g. a Railway Volume) rather than the container's own ephemeral
+ * filesystem — that filesystem is wiped on every restart, including the
+ * periodic one in restartScheduler.ts, so anything written outside the
+ * mounted volume would be silently lost. The directory is created if it
+ * doesn't exist yet, in case the volume is empty on first run.
  *
  * A failure (select or delete error) throws, leaving any not-yet-deleted
  * batch in Supabase — batches already fully written and deleted before
@@ -53,8 +61,8 @@ export async function runArchive(): Promise<ArchiveResult> {
   const cutoff = new Date(Date.now() - MAX_AGE_MS).toISOString();
   const dateStr = new Date().toISOString().slice(0, 10);
 
-  fs.mkdirSync(ARCHIVE_DIR, { recursive: true });
-  const filePath = path.join(ARCHIVE_DIR, `price_gaps_${dateStr}.csv`);
+  fs.mkdirSync(config.archiveDir, { recursive: true });
+  const filePath = path.join(config.archiveDir, `price_gaps_${dateStr}.csv`);
   if (!fs.existsSync(filePath)) {
     fs.writeFileSync(filePath, COLUMNS.join(",") + "\n");
   }
