@@ -7,7 +7,11 @@ import { startStalenessWatchdog } from "./watchdog";
 import { startPeriodicRestart } from "./restartScheduler";
 import { createConnectionManager } from "./connectionManager";
 
-const ARCHIVE_INTERVAL_MS = 12 * 60 * 60 * 1000; // 12 hours
+// Must stay comfortably below RESTART_INTERVAL_MS — the archive scheduler
+// also runs once immediately on startup (see archiveScheduler.ts), but this
+// interval is what lets it fire again during a single long-lived process,
+// rather than being reset by every restart before it ever gets a turn.
+const ARCHIVE_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours
 const RESTART_INTERVAL_MS = 8 * 60 * 60 * 1000; // 8 hours
 
 function createConnection(): Connection {
