@@ -8,6 +8,8 @@ const MAX_ATTEMPTS_PER_WINDOW = 8;
 const ATTEMPT_WINDOW_MS = 5 * 60 * 1000;
 const WS_OPEN_TIMEOUT_MS = 10 * 1000;
 const STABLE_CONNECTION_MS = 30 * 1000;
+const MAX_CONSECUTIVE_FAILURES = 12;
+const GIVE_UP_COOLDOWN_MS = 15 * 60 * 1000;
 
 interface AttachedHandlers {
   onError: () => void;
@@ -39,6 +41,23 @@ export interface ConnectionManager {
  * attempts per time window. Both the raw WS error/close handlers and the
  * staleness watchdog (watchdog.ts) funnel through requestReconnect(), so
  * there is only ever one reconnect attempt in flight at a time.
+ *
+ * Reconnects the entire shared connection, not per-pool — there's no way
+ * to reconnect a single pool's subscriptions independently. Because the
+ * old connection is only replaced once a new one's WebSocket is confirmed
+ * open, other pools can keep working fine on the old connection the whole
+ * time a reconnect chain is failing for some other pool's detected
+ * staleness.
+ *
+ * The per-window attempt cap above stops mattering once backoff saturates
+ * at MAX_BACKOFF_MS (each cycle then takes ~70s, so only ~4 fit in a
+ * 5-minute window — never enough to trip an 8-attempt cap). Without a
+ * separate ceiling, a connection whose WebSocket keeps failing to open
+ * would retry at the 60s cap forever. MAX_CONSECUTIVE_FAILURES exists for
+ * exactly that: after enough consecutive failures, give up for
+ * GIVE_UP_COOLDOWN_MS (logging clearly) rather than retrying forever —
+ * the periodic process restart (restartScheduler.ts) remains the ultimate
+ * backstop regardless.
  */
 export function createConnectionManager(
   createConnection: () => Connection,
@@ -48,6 +67,8 @@ export function createConnectionManager(
   let backoffMs = INITIAL_BACKOFF_MS;
   let reconnecting = false;
   let stabilityTimer: NodeJS.Timeout | undefined;
+  let consecutiveFailures = 0;
+  let giveUpUntil: number | null = null;
   const attemptTimestamps: number[] = [];
   const handlersByConnection = new WeakMap<Connection, AttachedHandlers>();
 
@@ -215,6 +236,7 @@ export function createConnectionManager(
       stabilityTimer = setTimeout(() => {
         stabilityTimer = undefined;
         backoffMs = INITIAL_BACKOFF_MS;
+        consecutiveFailures = 0;
         console.log(
           `[${new Date().toISOString()}] Connection stable for ${STABLE_CONNECTION_MS / 1000}s — backoff reset to initial.`
         );
@@ -223,13 +245,52 @@ export function createConnectionManager(
       if (newConnection) {
         tryCloseConnection(newConnection);
       }
-      console.error(`[${new Date().toISOString()}] Reconnect attempt failed (trigger: ${reason}):`, err);
+      consecutiveFailures++;
+      console.error(
+        `[${new Date().toISOString()}] Reconnect attempt failed (trigger: ${reason}, ` +
+          `consecutive failures: ${consecutiveFailures}):`,
+        err
+      );
+
+      // Once backoff saturates at MAX_BACKOFF_MS, each cycle takes roughly
+      // MAX_BACKOFF_MS + WS_OPEN_TIMEOUT_MS — far too slow for
+      // MAX_ATTEMPTS_PER_WINDOW to ever trip (at the 60s/10s defaults, only
+      // ~4 attempts fit in a 5-minute window, well under the cap of 8). So
+      // without this, a connection that keeps opening-then-failing forever
+      // would retry forever too. This is the actual ceiling for that case.
+      if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+        giveUpUntil = Date.now() + GIVE_UP_COOLDOWN_MS;
+        reconnecting = false;
+        console.error(
+          `[${new Date().toISOString()}] Giving up after ${consecutiveFailures} consecutive reconnect ` +
+            `failures (trigger: ${reason}) — will not retry until ` +
+            `${new Date(giveUpUntil).toISOString()} (${(GIVE_UP_COOLDOWN_MS / 60000).toFixed(1)} min from now), ` +
+            `or the next scheduled process restart, whichever comes first. If this pool's data staying ` +
+            `stale that long is a problem, a manual restart may be needed sooner.`
+        );
+        return;
+      }
+
       backoffMs = Math.min(backoffMs * BACKOFF_MULTIPLIER, MAX_BACKOFF_MS);
       scheduleAttempt(reason);
     }
   }
 
   function requestReconnect(reason: string): void {
+    if (giveUpUntil !== null) {
+      if (Date.now() < giveUpUntil) {
+        console.warn(
+          `[${new Date().toISOString()}] Reconnect request (${reason}) ignored — cooling down after ` +
+            `giving up until ${new Date(giveUpUntil).toISOString()}.`
+        );
+        return;
+      }
+      // Cooldown elapsed — allow a fresh attempt chain, starting clean.
+      giveUpUntil = null;
+      consecutiveFailures = 0;
+      backoffMs = INITIAL_BACKOFF_MS;
+    }
+
     if (stabilityTimer) {
       clearTimeout(stabilityTimer);
       stabilityTimer = undefined;
