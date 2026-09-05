@@ -30,7 +30,7 @@ export function startStalenessWatchdog(requestReconnect: (reason: string) => voi
 
   function checkStaleness(): void {
     const now = Date.now();
-    let needsReconnect = false;
+    const staleKeys: string[] = [];
 
     for (const pool of POOLS) {
       const cache = getPairCache(pool.pairName);
@@ -43,7 +43,7 @@ export function startStalenessWatchdog(requestReconnect: (reason: string) => voi
 
         const age = now - state.timestamp;
         if (age > STALE_RECONNECT_MS) {
-          needsReconnect = true;
+          staleKeys.push(key);
         } else if (age > STALE_WARNING_MS) {
           if (!staleSince.has(key)) {
             staleSince.set(key, now);
@@ -58,15 +58,15 @@ export function startStalenessWatchdog(requestReconnect: (reason: string) => voi
       }
     }
 
-    if (!needsReconnect) {
+    if (staleKeys.length === 0) {
       return;
     }
 
     staleSince.clear();
     console.error(
-      `[${new Date(now).toISOString()}] Stale subscription detected (no update for over ` +
-        `${STALE_RECONNECT_MS / 1000}s) — requesting reconnect.`
+      `[${new Date(now).toISOString()}] Stale subscription detected for [${staleKeys.join(", ")}] ` +
+        `(no update for over ${STALE_RECONNECT_MS / 1000}s) — requesting reconnect.`
     );
-    requestReconnect("staleness detected");
+    requestReconnect(`staleness: ${staleKeys.join(", ")}`);
   }
 }
