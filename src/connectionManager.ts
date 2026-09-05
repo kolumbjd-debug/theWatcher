@@ -7,6 +7,12 @@ const BACKOFF_MULTIPLIER = 2;
 const MAX_ATTEMPTS_PER_WINDOW = 8;
 const ATTEMPT_WINDOW_MS = 5 * 60 * 1000;
 const WS_OPEN_TIMEOUT_MS = 10 * 1000;
+const STABLE_CONNECTION_MS = 30 * 1000;
+
+interface AttachedHandlers {
+  onError: () => void;
+  onClose: () => void;
+}
 
 export interface ConnectionManager {
   getConnection(): Connection;
@@ -41,7 +47,9 @@ export function createConnectionManager(
   let connection = initialConnection;
   let backoffMs = INITIAL_BACKOFF_MS;
   let reconnecting = false;
+  let stabilityTimer: NodeJS.Timeout | undefined;
   const attemptTimestamps: number[] = [];
+  const handlersByConnection = new WeakMap<Connection, AttachedHandlers>();
 
   attachRawSocketHandlers(connection);
 
@@ -50,18 +58,51 @@ export function createConnectionManager(
       const internal = conn as unknown as {
         _rpcWebSocket?: {
           setAutoReconnect?: (enabled: boolean) => void;
-          on?: (event: string, cb: (...args: unknown[]) => void) => void;
+          on?: (event: string, cb: () => void) => void;
         };
       };
       internal._rpcWebSocket?.setAutoReconnect?.(false);
-      internal._rpcWebSocket?.on?.("error", () => requestReconnect("ws error"));
-      internal._rpcWebSocket?.on?.("close", () => requestReconnect("ws close"));
+      const onError = () => requestReconnect("ws error");
+      const onClose = () => requestReconnect("ws close");
+      internal._rpcWebSocket?.on?.("error", onError);
+      internal._rpcWebSocket?.on?.("close", onClose);
+      handlersByConnection.set(conn, { onError, onClose });
     } catch {
       // best-effort only — @solana/web3.js doesn't expose this publicly
     }
   }
 
+  /**
+   * Closing a connection's socket re-emits its OWN "close" event (confirmed
+   * in rpc-websockets' source: close() calls the underlying socket's
+   * close(), whose native close handler re-emits the client's "close" event
+   * if it had been open). Without this, our own cleanup of the old
+   * connection after a successful reconnect would immediately fire our own
+   * "ws close" listener on that old connection and request ANOTHER
+   * reconnect — a fully self-inflicted loop indistinguishable from a real
+   * repeated failure. Detaching first (by exact function reference, not
+   * removeAllListeners — @solana/web3.js has its own internal close/error
+   * listeners on the same emitter that must stay intact) breaks that loop.
+   */
+  function detachRawSocketHandlers(conn: Connection): void {
+    try {
+      const handlers = handlersByConnection.get(conn);
+      if (!handlers) {
+        return;
+      }
+      const internal = conn as unknown as {
+        _rpcWebSocket?: { off?: (event: string, cb: () => void) => void };
+      };
+      internal._rpcWebSocket?.off?.("error", handlers.onError);
+      internal._rpcWebSocket?.off?.("close", handlers.onClose);
+      handlersByConnection.delete(conn);
+    } catch {
+      // best-effort only
+    }
+  }
+
   function tryCloseConnection(conn: Connection): void {
+    detachRawSocketHandlers(conn);
     try {
       const internal = conn as unknown as { _rpcWebSocket?: { close?: () => void } };
       internal._rpcWebSocket?.close?.();
@@ -159,12 +200,25 @@ export function createConnectionManager(
 
       tryCloseConnection(oldConnection);
       connection = newConnection;
-
-      backoffMs = INITIAL_BACKOFF_MS;
       reconnecting = false;
+
+      // Do NOT reset backoff yet — a connection that opens and then closes
+      // again almost immediately (a fast bounce, e.g. still-rate-limited)
+      // is not a real recovery. Only reset once it's stayed up for
+      // STABLE_CONNECTION_MS; requestReconnect() cancels this timer if
+      // another failure arrives first, so backoff keeps escalating across
+      // a string of quick opens-then-closes instead of resetting each time.
       console.log(
-        `[${new Date().toISOString()}] Reconnected and resubscribed successfully (trigger: ${reason}).`
+        `[${new Date().toISOString()}] Reconnected and resubscribed (trigger: ${reason}) — ` +
+          `backoff will reset after ${STABLE_CONNECTION_MS / 1000}s of stable connection.`
       );
+      stabilityTimer = setTimeout(() => {
+        stabilityTimer = undefined;
+        backoffMs = INITIAL_BACKOFF_MS;
+        console.log(
+          `[${new Date().toISOString()}] Connection stable for ${STABLE_CONNECTION_MS / 1000}s — backoff reset to initial.`
+        );
+      }, STABLE_CONNECTION_MS);
     } catch (err) {
       if (newConnection) {
         tryCloseConnection(newConnection);
@@ -176,6 +230,10 @@ export function createConnectionManager(
   }
 
   function requestReconnect(reason: string): void {
+    if (stabilityTimer) {
+      clearTimeout(stabilityTimer);
+      stabilityTimer = undefined;
+    }
     if (reconnecting) {
       return;
     }
