@@ -1,7 +1,5 @@
-import { Connection } from "@solana/web3.js";
 import { POOLS } from "./pools";
 import { getPairCache, DexId } from "./priceCache";
-import { startWatcher } from "./watcher";
 
 const CHECK_INTERVAL_MS = 30 * 1000;
 const STALE_WARNING_MS = 2 * 60 * 1000;
@@ -15,31 +13,22 @@ const DEX_IDS: readonly DexId[] = ["raydium", "orca"];
  * is thrown, the account just goes quiet. This watchdog uses each pair's
  * per-DEX cache timestamp (set on every real account-change callback, see
  * priceCache.ts) as a liveness signal: if either side hasn't updated
- * within STALE_RECONNECT_MS, it tears down and recreates the connection
- * and every subscription from scratch.
+ * within STALE_RECONNECT_MS, it asks the connection manager
+ * (connectionManager.ts) to reconnect.
  *
- * Connection has no public close() method, so the old connection's socket
- * is cleaned up best-effort via its internal client — wrapped in try/catch
- * so a future @solana/web3.js version can't break reconnection even if
- * that cleanup silently stops working.
+ * This module no longer owns any Connection or reconnect logic itself —
+ * it just detects staleness and delegates via requestReconnect, so there's
+ * a single, shared, backoff-guarded reconnect path regardless of whether
+ * the trigger is a raw WebSocket error or detected staleness.
  */
-export function startStalenessWatchdog(
-  createConnection: () => Connection,
-  initialConnection: Connection
-): void {
-  let connection = initialConnection;
-  let recovering = false;
+export function startStalenessWatchdog(requestReconnect: (reason: string) => void): void {
   const staleSince = new Map<string, number>();
 
   setInterval(() => {
-    void checkAndRecover();
+    checkStaleness();
   }, CHECK_INTERVAL_MS);
 
-  async function checkAndRecover(): Promise<void> {
-    if (recovering) {
-      return;
-    }
-
+  function checkStaleness(): void {
     const now = Date.now();
     let needsReconnect = false;
 
@@ -73,32 +62,11 @@ export function startStalenessWatchdog(
       return;
     }
 
-    recovering = true;
+    staleSince.clear();
     console.error(
       `[${new Date(now).toISOString()}] Stale subscription detected (no update for over ` +
-        `${STALE_RECONNECT_MS / 1000}s) — reconnecting and resubscribing all pools.`
+        `${STALE_RECONNECT_MS / 1000}s) — requesting reconnect.`
     );
-
-    try {
-      const oldConnection = connection;
-      connection = createConnection();
-      await startWatcher(connection);
-      tryCloseConnection(oldConnection);
-      staleSince.clear();
-      console.log(`[${new Date().toISOString()}] Reconnected and resubscribed successfully.`);
-    } catch (err) {
-      console.error(`[${new Date().toISOString()}] Reconnect attempt failed:`, err);
-    } finally {
-      recovering = false;
-    }
-  }
-}
-
-function tryCloseConnection(connection: Connection): void {
-  try {
-    const internal = connection as unknown as { _rpcWebSocket?: { close?: () => void } };
-    internal._rpcWebSocket?.close?.();
-  } catch {
-    // best-effort only — @solana/web3.js doesn't expose a public close method
+    requestReconnect("staleness detected");
   }
 }

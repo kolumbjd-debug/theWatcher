@@ -5,6 +5,7 @@ import { startWatcher } from "./watcher";
 import { startArchiveScheduler } from "./archiveScheduler";
 import { startStalenessWatchdog } from "./watchdog";
 import { startPeriodicRestart } from "./restartScheduler";
+import { createConnectionManager } from "./connectionManager";
 
 const ARCHIVE_INTERVAL_MS = 12 * 60 * 60 * 1000; // 12 hours
 const RESTART_INTERVAL_MS = 8 * 60 * 60 * 1000; // 8 hours
@@ -33,8 +34,10 @@ async function main() {
   await startWatcher(connection);
   console.log("Watcher running, logging price gaps as they come in.");
 
+  const connectionManager = createConnectionManager(createConnection, connection);
+
   startArchiveScheduler(ARCHIVE_INTERVAL_MS);
-  startStalenessWatchdog(createConnection, connection);
+  startStalenessWatchdog(connectionManager.requestReconnect);
   startPeriodicRestart(RESTART_INTERVAL_MS);
 }
 
